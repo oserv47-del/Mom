@@ -27,13 +27,11 @@ if (!TELEGRAM_TOKEN || !SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: false });
 
-// Set webhook if SERVER_URL provided
+// Set webhook
 if (SERVER_URL) {
   bot.setWebHook(`${SERVER_URL}/webhook`).then(() => {
-    console.log('Webhook set successfully');
-  }).catch(err => {
-    console.error('Failed to set webhook:', err);
-  });
+    console.log('Webhook set');
+  }).catch(console.error);
 }
 
 // ==================== Store connected clients ====================
@@ -43,30 +41,20 @@ const termuxClients = new Map();     // socket.id -> { socket, deviceId }
 // ==================== Helper: Store command result in Supabase ====================
 async function storeResult(deviceId, command, result, type = null) {
   try {
-    const { error } = await supabase
-      .from('command_results')
-      .insert([{ device_id: deviceId, command, result, type }]);
-    if (error) throw error;
+    await supabase.from('command_results').insert([{ device_id: deviceId, command, result, type }]);
   } catch (err) {
-    console.error('Error storing result:', err);
+    console.error('DB error:', err);
   }
 }
 
 // ==================== Helper: Update device last seen ====================
 async function updateDeviceLastSeen(deviceId, info = null) {
-  try {
-    const updateData = { last_seen: new Date() };
-    if (info) updateData.info = info;
-    const { error } = await supabase
-      .from('devices')
-      .upsert({ id: deviceId, ...updateData }, { onConflict: 'id' });
-    if (error) throw error;
-  } catch (err) {
-    console.error('Error updating device:', err);
-  }
+  const update = { last_seen: new Date() };
+  if (info) update.info = info;
+  await supabase.from('devices').upsert({ id: deviceId, ...update }, { onConflict: 'id' });
 }
 
-// ==================== Telegram Keyboard Markup ====================
+// ==================== Telegram Keyboard ====================
 const mainKeyboard = {
   reply_markup: {
     keyboard: [
@@ -83,7 +71,7 @@ const mainKeyboard = {
 
 // ==================== WebSocket ====================
 io.on('connection', (socket) => {
-  console.log('New client connected:', socket.id);
+  console.log('New client:', socket.id);
 
   // Android device registration
   socket.on('register', async (data) => {
@@ -92,13 +80,13 @@ io.on('connection', (socket) => {
       devices.set(deviceId, socket);
       socket.deviceId = deviceId;
       socket.isDevice = true;
-      console.log(`Device registered: ${deviceId}`);
       await updateDeviceLastSeen(deviceId, info);
       socket.emit('registered', { status: 'ok' });
+      console.log(`Device registered: ${deviceId}`);
     }
   });
 
-  // Termux client registration (listens to a specific device)
+  // Termux client registration
   socket.on('termuxListen', (data) => {
     const { deviceId } = data;
     if (deviceId) {
@@ -109,23 +97,20 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Command result from Android device
+  // Command result from Android
   socket.on('commandResult', async (data) => {
     const { command, result, chatId, type } = data;
     const deviceId = socket.deviceId;
     if (!deviceId) return;
 
-    // Store in Supabase
     await storeResult(deviceId, command, result, type);
 
-    // If this command came from Telegram (chatId present), send to Telegram
+    // Send to Telegram if from there
     if (chatId) {
-      bot.sendMessage(chatId, result, { parse_mode: 'HTML' }).catch(err => {
-        console.error('Failed to send Telegram message:', err);
-      });
+      bot.sendMessage(chatId, result, { parse_mode: 'HTML' }).catch(console.error);
     }
 
-    // Also send to any Termux client listening to this device
+    // Send to Termux clients listening to this device
     for (const [_, client] of termuxClients) {
       if (client.deviceId === deviceId) {
         client.socket.emit('commandResult', { command, result, type });
@@ -134,13 +119,8 @@ io.on('connection', (socket) => {
   });
 
   socket.on('disconnect', () => {
-    console.log('Client disconnected:', socket.id);
-    if (socket.isDevice && socket.deviceId) {
-      devices.delete(socket.deviceId);
-    }
-    if (socket.isTermux) {
-      termuxClients.delete(socket.id);
-    }
+    if (socket.isDevice && socket.deviceId) devices.delete(socket.deviceId);
+    if (socket.isTermux) termuxClients.delete(socket.id);
   });
 });
 
@@ -150,25 +130,20 @@ app.post('/webhook', (req, res) => {
   if (update.message) {
     const chatId = update.message.chat.id;
     const text = update.message.text;
-    const deviceId = chatId.toString(); // using chat ID as device ID (one device per chat)
 
-    // Handle /start command
     if (text === '/start') {
-      bot.sendMessage(chatId, 'Welcome! Select a command:', mainKeyboard)
-        .catch(console.error);
+      bot.sendMessage(chatId, 'Welcome! Select a command:', mainKeyboard).catch(console.error);
       return res.sendStatus(200);
     }
 
-    // Forward command to device if online
+    const deviceId = chatId.toString();
     const deviceSocket = devices.get(deviceId);
     if (deviceSocket) {
       deviceSocket.emit('command', { command: text, chatId });
-      res.sendStatus(200);
     } else {
-      bot.sendMessage(chatId, '❌ Device is offline or not registered.')
-        .catch(console.error);
-      res.sendStatus(200);
+      bot.sendMessage(chatId, '❌ Device is offline or not registered.').catch(console.error);
     }
+    res.sendStatus(200);
   } else {
     res.sendStatus(200);
   }
@@ -177,58 +152,26 @@ app.post('/webhook', (req, res) => {
 // ==================== Termux Command Endpoint ====================
 app.post('/sendCommand', async (req, res) => {
   const { deviceId, command } = req.body;
-  if (!deviceId || !command) {
-    return res.status(400).json({ error: 'deviceId and command required' });
-  }
+  if (!deviceId || !command) return res.status(400).json({ error: 'deviceId and command required' });
 
   const deviceSocket = devices.get(deviceId);
   if (deviceSocket) {
     deviceSocket.emit('command', { command, chatId: null });
     res.json({ status: 'sent' });
   } else {
-    const { data, error } = await supabase
-      .from('devices')
-      .select('id')
-      .eq('id', deviceId)
-      .single();
-    if (data) {
-      res.status(404).json({ error: 'Device is offline' });
-    } else {
-      res.status(404).json({ error: 'Device not found' });
-    }
+    const { data } = await supabase.from('devices').select('id').eq('id', deviceId).single();
+    res.status(404).json({ error: data ? 'Device is offline' : 'Device not found' });
   }
 });
 
-// ==================== API Endpoints for Termux Device Selection ====================
+// ==================== API for Termux Device List ====================
 app.get('/api/devices', async (req, res) => {
-  const { data, error } = await supabase
-    .from('devices')
-    .select('*')
-    .order('last_seen', { ascending: false });
+  const { data, error } = await supabase.from('devices').select('*').order('last_seen', { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
 
-app.get('/api/results/:deviceId', async (req, res) => {
-  const { deviceId } = req.params;
-  const limit = parseInt(req.query.limit) || 50;
-  const { data, error } = await supabase
-    .from('command_results')
-    .select('*')
-    .eq('device_id', deviceId)
-    .order('created_at', { ascending: false })
-    .limit(limit);
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
-});
+app.get('/', (req, res) => res.send('Monitor Server is running'));
 
-// ==================== Health Check ====================
-app.get('/', (req, res) => {
-  res.send('Monitor Server is running with Supabase and Telegram bot');
-});
-
-// ==================== Start Server ====================
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
-});
+server.listen(PORT, () => console.log(`Server on port ${PORT}`));
