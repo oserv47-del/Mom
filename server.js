@@ -36,7 +36,7 @@ if (SERVER_URL) {
   });
 }
 
-// ==================== Store connected clients ====================
+// ==================== Store connected devices ====================
 const devices = new Map();           // deviceId -> socket (Android)
 const termuxClients = new Map();     // socket.id -> { socket, deviceId }
 
@@ -64,6 +64,33 @@ async function updateDeviceLastSeen(deviceId, info = null) {
   } catch (err) {
     console.error('Error updating device:', err);
   }
+}
+
+// ==================== Helper: Get device ID for a chat ====================
+async function getDeviceIdForChat(chatId) {
+  const { data, error } = await supabase
+    .from('devices')
+    .select('id')
+    .eq('chat_id', chatId.toString())
+    .maybeSingle();
+  if (error) {
+    console.error('Error fetching device for chat:', error);
+    return null;
+  }
+  return data?.id;
+}
+
+// ==================== Helper: Pair chat with device ====================
+async function pairChatWithDevice(chatId, deviceId) {
+  const { error } = await supabase
+    .from('devices')
+    .update({ chat_id: chatId.toString() })
+    .eq('id', deviceId);
+  if (error) {
+    console.error('Error pairing:', error);
+    return false;
+  }
+  return true;
 }
 
 // ==================== Telegram Keyboard Markup ====================
@@ -98,7 +125,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Termux client registration (listens to a specific device)
+  // Termux client registration
   socket.on('termuxListen', (data) => {
     const { deviceId } = data;
     if (deviceId) {
@@ -109,23 +136,20 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Command result from Android device
+  // Command result from Android
   socket.on('commandResult', async (data) => {
     const { command, result, chatId, type } = data;
     const deviceId = socket.deviceId;
     if (!deviceId) return;
 
-    // Store in Supabase
     await storeResult(deviceId, command, result, type);
 
-    // If this command came from Telegram (chatId present), send to Telegram
     if (chatId) {
       bot.sendMessage(chatId, result, { parse_mode: 'HTML' }).catch(err => {
         console.error('Failed to send Telegram message:', err);
       });
     }
 
-    // Also send to any Termux client listening to this device
     for (const [_, client] of termuxClients) {
       if (client.deviceId === deviceId) {
         client.socket.emit('commandResult', { command, result, type });
@@ -146,30 +170,83 @@ io.on('connection', (socket) => {
 });
 
 // ==================== Telegram Webhook ====================
-app.post('/webhook', (req, res) => {
+app.post('/webhook', async (req, res) => {
   const update = req.body;
   if (update.message) {
     const chatId = update.message.chat.id;
     const text = update.message.text;
-    const deviceId = chatId.toString(); // assuming one device per chat
 
     console.log(`Telegram message from ${chatId}: ${text}`);
 
     // Handle /start command
     if (text === '/start') {
-      bot.sendMessage(chatId, 'Welcome! Select a command:', mainKeyboard)
+      bot.sendMessage(chatId, 'Welcome! Use /listdevices to see available devices, then /pair <deviceId> to connect.', mainKeyboard)
         .catch(console.error);
       return res.sendStatus(200);
     }
 
-    // Forward command to device if online
+    // Handle /listdevices command
+    if (text === '/listdevices') {
+      const { data, error } = await supabase
+        .from('devices')
+        .select('id, info, last_seen')
+        .order('last_seen', { ascending: false });
+      if (error) {
+        bot.sendMessage(chatId, 'Error fetching devices.').catch(console.error);
+        return res.sendStatus(200);
+      }
+      let msg = '📱 Registered devices:\n';
+      data.forEach((dev, i) => {
+        const status = devices.has(dev.id) ? '🟢 online' : '🔴 offline';
+        const model = dev.info?.model || 'Unknown';
+        msg += `\n${i+1}. ${dev.id} – ${model} (${status})`;
+      });
+      bot.sendMessage(chatId, msg).catch(console.error);
+      return res.sendStatus(200);
+    }
+
+    // Handle /pair command
+    if (text.startsWith('/pair ')) {
+      const deviceId = text.substring(6).trim();
+      if (!deviceId) {
+        bot.sendMessage(chatId, 'Usage: /pair <deviceId>').catch(console.error);
+        return res.sendStatus(200);
+      }
+      // Check if device exists
+      const { data, error } = await supabase
+        .from('devices')
+        .select('id')
+        .eq('id', deviceId)
+        .maybeSingle();
+      if (error || !data) {
+        bot.sendMessage(chatId, 'Device not found.').catch(console.error);
+        return res.sendStatus(200);
+      }
+      const success = await pairChatWithDevice(chatId, deviceId);
+      if (success) {
+        bot.sendMessage(chatId, `✅ Paired with device ${deviceId}. You can now send commands.`, mainKeyboard)
+          .catch(console.error);
+      } else {
+        bot.sendMessage(chatId, '❌ Failed to pair.').catch(console.error);
+      }
+      return res.sendStatus(200);
+    }
+
+    // Handle normal commands – get device ID for this chat
+    const deviceId = await getDeviceIdForChat(chatId);
+    if (!deviceId) {
+      bot.sendMessage(chatId, '❌ No device paired with this chat. Use /listdevices and /pair <deviceId> first.')
+        .catch(console.error);
+      return res.sendStatus(200);
+    }
+
     const deviceSocket = devices.get(deviceId);
     if (deviceSocket) {
       deviceSocket.emit('command', { command: text, chatId });
       console.log(`Command forwarded to device ${deviceId}`);
       res.sendStatus(200);
     } else {
-      bot.sendMessage(chatId, '❌ Device is offline or not registered.')
+      bot.sendMessage(chatId, '❌ Device is offline. Please ensure it is connected.')
         .catch(console.error);
       console.log(`Device ${deviceId} not online`);
       res.sendStatus(200);
@@ -192,7 +269,6 @@ app.post('/sendCommand', async (req, res) => {
     console.log(`Command sent to device ${deviceId} from Termux`);
     res.json({ status: 'sent' });
   } else {
-    // Check if device exists in database but offline
     const { data, error } = await supabase
       .from('devices')
       .select('id')
